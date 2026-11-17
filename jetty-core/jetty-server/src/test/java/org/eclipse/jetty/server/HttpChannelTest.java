@@ -71,7 +71,6 @@ import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class HttpChannelTest
@@ -238,7 +237,11 @@ public class HttpChannelTest
         Runnable todo = channel.onRequest(request);
         new Thread(todo).start(); // handling will block for content
 
-        assertNull(stream.addContent("01234567890", true));
+        // addContent returns the handler's wakeup task when the handler thread demanded
+        // content first; run it, as HttpConnection does.
+        Runnable onContentAvailable = stream.addContent("01234567890", true);
+        if (onContentAvailable != null)
+            onContentAvailable.run();
 
         stream.waitForComplete(10, TimeUnit.SECONDS);
 
@@ -609,6 +612,10 @@ public class HttpChannelTest
         assertEquals(500, response.getStatus());
         assertFalse(response.contains(HttpHeader.CONNECTION, "close"));
         assertThat(response.getContent(), containsString("5 &lt; 10"));
+
+        // writeFailureRef is set only after the handler callback has completed the response.
+        for (int i = 0; i < 100 && writeFailureRef.get() == null; i++)
+            Thread.sleep(50);
 
         Throwable x = writeFailureRef.get();
         assertThat(x, notNullValue());

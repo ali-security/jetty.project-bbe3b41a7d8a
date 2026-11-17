@@ -1,0 +1,166 @@
+name: "Seal build"
+
+# Upstream builds and tests Jetty on Jenkins (Jenkinsfile: `mvn clean install`
+# on JDK 17/21/25); its only GitHub workflows are CodeQL (`-P fast`, tests
+# skipped) and a stale-issue bot. This workflow builds jetty-server and runs the
+# test suites of the modules it depends on, plus the suites of the other modules
+# whose sources the pending security patches touch.
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated surefire -Dtest selectors; empty runs the full suites"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  MAVEN_OPTS: "-Djava.awt.headless=true -Xmx4G -Xms2G"
+  # Build-environment flags, not source edits:
+  # - the .mvn/rrf/*.txt allow-lists referenced by .mvn/maven.config ship empty
+  #   (upstream regenerates them on Jenkins), so the remote repository filters
+  #   would block every download from Central;
+  # - the maven-build-cache-extension is disabled (Jenkins uses skipCache);
+  # - lint/style/licence/coverage gates (checkstyle, spotless, license headers,
+  #   enforcer, spotbugs, jacoco) are skipped -- Jenkinsfile also skips spotbugs/jacoco;
+  # - JUnit parallel class execution is turned off (root pom enables dynamic
+  #   concurrency, which starves Jetty's socket-timing tests on a small runner),
+  #   a 5 minute per-test timeout turns a deadlocked test into a named failure,
+  #   and failing tests are re-run (upstream's `ci` profile re-runs once).
+  MVN_COMMON: >-
+    -B -e -V -ntp
+    -Daether.remoteRepositoryFilter.groupId=false
+    -Daether.remoteRepositoryFilter.prefixes=false
+    -Dmaven.build.cache.enabled=false
+    -Dcheckstyle.skip=true -Dspotless.check.skip=true -Dspotless.skip=true
+    -Dlicense.skip=true -Denforcer.skip=true -Dspotbugs.skip=true -Djacoco.skip=true
+    -Dmaven.javadoc.skip=true -Dgpg.skip=true
+    -Djunit.jupiter.execution.parallel.enabled=false
+    -Djunit.jupiter.execution.timeout.default=5m
+    -Dsurefire.rerunFailingTestsCount=5
+
+jobs:
+  jetty-server:
+    name: Build jetty-server + test upstream reactor
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Prepare Mimir
+        shell: bash
+        run: |
+          mkdir -p ~/.mimir
+          cp .github/ci-mimir-daemon.properties ~/.mimir/daemon.properties
+
+      - name: Set up Maven
+        run: mvn -e -B -V org.apache.maven.plugins:maven-wrapper-plugin:3.3.2:wrapper "-Dmaven=3.9.14"
+
+      - name: Build and test
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            TF="${{ inputs.test-filter }}"
+            ./mvnw clean install -pl jetty-core/jetty-server -am $MVN_COMMON \
+              -Dtest="${TF// /,}" -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            # Upstream modules of jetty-server (jetty-util, jetty-http, jetty-io, ...) with tests.
+            ./mvnw clean install -pl 'jetty-core/jetty-server,!jetty-core/jetty-server' -am $MVN_COMMON
+            # jetty-server itself: the timeout must run the test on a separate thread to
+            # interrupt a blocked socket read (that mode breaks jetty-slf4j-impl's
+            # JettyLoggerTest, which asserts its thread name, hence two invocations).
+            ./mvnw clean install -pl jetty-core/jetty-server $MVN_COMMON \
+              -Djunit.jupiter.execution.timeout.thread.mode.default=SEPARATE_THREAD
+          fi
+
+      - name: List skipped tests with reasons
+        if: always()
+        shell: bash
+        run: python3 .github/seal-report-skips.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: jetty-server-jars
+          if-no-files-found: error
+          path: |
+            jetty-core/jetty-server/target/jetty-server-*[0-9].jar
+            jetty-core/jetty-server/target/jetty-server-*-config.jar
+
+  patched-modules:
+    name: Test ${{ matrix.leg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: core-client
+            full: jetty-core/jetty-client
+            scoped: jetty-core/jetty-tests/jetty-test-client-transports
+            scoped_tests: HttpClientTest
+          - leg: ee10
+            full: jetty-ee10/jetty-ee10-proxy,jetty-ee10/jetty-ee10-fcgi-proxy,jetty-ee10/jetty-ee10-servlets,jetty-ee10/jetty-ee10-servlet
+          - leg: ee11
+            full: jetty-ee11/jetty-ee11-proxy,jetty-ee11/jetty-ee11-fcgi-proxy,jetty-ee11/jetty-ee11-servlets,jetty-ee11/jetty-ee11-servlet
+          - leg: ee9
+            full: jetty-ee9/jetty-ee9-proxy,jetty-ee9/jetty-ee9-fcgi-proxy,jetty-ee9/jetty-ee9-servlets,jetty-ee9/jetty-ee9-nested
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Setup JDK 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Prepare Mimir
+        shell: bash
+        run: |
+          mkdir -p ~/.mimir
+          cp .github/ci-mimir-daemon.properties ~/.mimir/daemon.properties
+
+      - name: Set up Maven
+        run: mvn -e -B -V org.apache.maven.plugins:maven-wrapper-plugin:3.3.2:wrapper "-Dmaven=3.9.14"
+
+      - name: Install module dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          PL="${{ matrix.full }}"
+          if [ -n "${{ matrix.scoped }}" ]; then PL="$PL,${{ matrix.scoped }}"; fi
+          ./mvnw clean install -pl "$PL" -am -DskipTests $MVN_COMMON
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            TF="${{ inputs.test-filter }}"
+            PL="${{ matrix.full }}"
+            if [ -n "${{ matrix.scoped }}" ]; then PL="$PL,${{ matrix.scoped }}"; fi
+            ./mvnw test -pl "$PL" $MVN_COMMON \
+              -Dtest="${TF// /,}" -Dsurefire.failIfNoSpecifiedTests=false
+          else
+            ./mvnw test -pl "${{ matrix.full }}" $MVN_COMMON
+            if [ -n "${{ matrix.scoped }}" ]; then
+              ./mvnw test -pl "${{ matrix.scoped }}" $MVN_COMMON -Dtest="${{ matrix.scoped_tests }}"
+            fi
+          fi
+
+      - name: List skipped tests with reasons
+        if: always()
+        shell: bash
+        run: python3 .github/seal-report-skips.py
