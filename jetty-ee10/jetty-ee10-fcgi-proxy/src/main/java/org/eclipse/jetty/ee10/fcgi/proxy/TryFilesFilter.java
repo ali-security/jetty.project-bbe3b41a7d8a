@@ -16,6 +16,7 @@ package org.eclipse.jetty.ee10.fcgi.proxy;
 import java.io.IOException;
 import java.net.URISyntaxException;
 import java.net.URL;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -30,6 +31,7 @@ import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import org.eclipse.jetty.util.StringUtil;
+import org.eclipse.jetty.util.TypeUtil;
 
 /**
  * Inspired by nginx's try_files functionality.
@@ -128,7 +130,37 @@ public class TryFilesFilter implements Filter
             path += info;
         if (!path.startsWith("/"))
             path = "/" + path;
-        return StringUtil.replace(value, "$path", path);
+        int p = value.indexOf("$path");
+        if (p < 0)
+            return value;
+        int q = value.indexOf('?');
+        if (q < 0)
+            return value.replace("$path", path);
+        return value.substring(0, q).replace("$path", path) +
+            value.substring(q).replace("$path", encodePathForQuery(path));
+    }
+
+    /**
+     * Encodes a canonical URI path to be used in a URI query.
+     *
+     * @param path the canonical path to encode
+     * @return the query encoded path
+     */
+    private static String encodePathForQuery(String path)
+    {
+        if (StringUtil.isEmpty(path))
+            return path;
+        byte[] bytes = path.getBytes(StandardCharsets.UTF_8);
+        StringBuilder builder = new StringBuilder(bytes.length + 8);
+        for (byte b : bytes)
+        {
+            // Characters that are allowed in path but need escaping in query.
+            if (b < 0 || b == '&' || b == '+' || b == '=')
+                TypeUtil.toHex(b, builder.append('%'));
+            else
+                builder.append((char)b);
+        }
+        return builder.toString();
     }
 
     @Override

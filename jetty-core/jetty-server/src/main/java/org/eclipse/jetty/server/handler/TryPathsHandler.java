@@ -13,6 +13,7 @@
 
 package org.eclipse.jetty.server.handler;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 import org.eclipse.jetty.http.HttpURI;
@@ -20,6 +21,8 @@ import org.eclipse.jetty.server.Handler;
 import org.eclipse.jetty.server.Request;
 import org.eclipse.jetty.server.Response;
 import org.eclipse.jetty.util.Callback;
+import org.eclipse.jetty.util.StringUtil;
+import org.eclipse.jetty.util.TypeUtil;
 import org.eclipse.jetty.util.URIUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -167,7 +170,37 @@ public class TryPathsHandler extends Handler.Wrapper
     private String interpolate(Request request, String value)
     {
         String path = Request.getPathInContext(request);
-        return value.replace("$path", path);
+        int p = value.indexOf("$path");
+        if (p < 0)
+            return value;
+        int q = value.indexOf('?');
+        if (q < 0)
+            return value.replace("$path", path);
+        return value.substring(0, q).replace("$path", path) +
+            value.substring(q).replace("$path", encodePathForQuery(path));
+    }
+
+    /**
+     * Encodes a canonical URI path to be used in a URI query.
+     *
+     * @param path the canonical path to encode
+     * @return the query encoded path
+     */
+    private static String encodePathForQuery(String path)
+    {
+        if (StringUtil.isEmpty(path))
+            return path;
+        byte[] bytes = path.getBytes(StandardCharsets.UTF_8);
+        StringBuilder builder = new StringBuilder(bytes.length + 8);
+        for (byte b : bytes)
+        {
+            // Characters that are allowed in path but need escaping in query.
+            if (b < 0 || b == '&' || b == '+' || b == '=')
+                TypeUtil.toHex(b, builder.append('%'));
+            else
+                builder.append((char)b);
+        }
+        return builder.toString();
     }
 
     private Request tryPath(Request wrapped, String newPathQuery)
