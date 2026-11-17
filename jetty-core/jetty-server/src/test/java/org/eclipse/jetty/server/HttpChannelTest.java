@@ -22,11 +22,13 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.stream.Stream;
 
+import org.eclipse.jetty.http.HttpCompliance;
 import org.eclipse.jetty.http.HttpFields;
 import org.eclipse.jetty.http.HttpHeader;
 import org.eclipse.jetty.http.HttpHeaderValue;
@@ -111,6 +113,155 @@ public class HttpChannelTest
         assertThat(stream.getResponse().getStatus(), equalTo(200));
         assertThat(stream.getResponseHeaders().get(HttpHeader.CONTENT_TYPE), equalTo(MimeTypes.Type.TEXT_PLAIN_UTF_8.asString()));
         assertThat(BufferUtil.toString(stream.getResponseContent()), equalTo(helloHandler.getMessage()));
+    }
+
+    @Test
+    public void testMismatchedAuthorityAndHostHeader() throws Exception
+    {
+        AtomicBoolean handled = new AtomicBoolean();
+        _server.setHandler(new Handler.Abstract.NonBlocking()
+        {
+            @Override
+            public boolean handle(Request request, Response response, Callback callback)
+            {
+                handled.set(true);
+                callback.succeeded();
+                return true;
+            }
+        });
+        _server.start();
+
+        ConnectionMetaData connectionMetaData = new MockConnectionMetaData(new MockConnector(_server));
+        HttpChannel channel = new HttpChannelState(connectionMetaData);
+        MockHttpStream stream = new MockHttpStream(channel);
+
+        // The request-target authority is "localhost", but the Host header says "elsewhere".
+        HttpFields fields = HttpFields.build().add(HttpHeader.HOST, "elsewhere").asImmutable();
+        MetaData.Request request = new MetaData.Request("GET", HttpURI.from("http://localhost/"), HttpVersion.HTTP_1_1, fields, 0);
+        Runnable task = channel.onRequest(request);
+        task.run();
+
+        assertThat(handled.get(), is(false));
+        assertThat(stream.isComplete(), is(true));
+        assertThat(stream.getResponse(), notNullValue());
+        assertThat(stream.getResponse().getStatus(), equalTo(400));
+    }
+
+    @Test
+    public void testMismatchedAuthorityAndHostHeaderAllowedByCompliance() throws Exception
+    {
+        HelloHandler helloHandler = new HelloHandler();
+        _server.setHandler(helloHandler);
+        _server.start();
+
+        MockConnectionMetaData connectionMetaData = new MockConnectionMetaData(new MockConnector(_server));
+        // RFC2616_LEGACY allows the MISMATCHED_AUTHORITY violation.
+        connectionMetaData.getHttpConfiguration().setHttpCompliance(HttpCompliance.RFC2616_LEGACY);
+        HttpChannel channel = new HttpChannelState(connectionMetaData);
+        MockHttpStream stream = new MockHttpStream(channel);
+
+        HttpFields fields = HttpFields.build().add(HttpHeader.HOST, "elsewhere").asImmutable();
+        MetaData.Request request = new MetaData.Request("GET", HttpURI.from("http://localhost/"), HttpVersion.HTTP_1_1, fields, 0);
+        Runnable task = channel.onRequest(request);
+        task.run();
+
+        assertThat(stream.isComplete(), is(true));
+        assertThat(stream.getResponse(), notNullValue());
+        assertThat(stream.getResponse().getStatus(), equalTo(200));
+    }
+
+    @Test
+    public void testAuthorityMatchesHostHeaderIgnoringCaseAndDefaultPort() throws Exception
+    {
+        HelloHandler helloHandler = new HelloHandler();
+        _server.setHandler(helloHandler);
+        _server.start();
+
+        ConnectionMetaData connectionMetaData = new MockConnectionMetaData(new MockConnector(_server));
+        HttpChannel channel = new HttpChannelState(connectionMetaData);
+        MockHttpStream stream = new MockHttpStream(channel);
+
+        // "LOCALHOST:80" and "localhost" are the same authority for the http scheme.
+        HttpFields fields = HttpFields.build().add(HttpHeader.HOST, "localhost").asImmutable();
+        MetaData.Request request = new MetaData.Request("GET", HttpURI.from("http://LOCALHOST:80/"), HttpVersion.HTTP_1_1, fields, 0);
+        Runnable task = channel.onRequest(request);
+        task.run();
+
+        assertThat(stream.isComplete(), is(true));
+        assertThat(stream.getFailure(), nullValue());
+        assertThat(stream.getResponse(), notNullValue());
+        assertThat(stream.getResponse().getStatus(), equalTo(200));
+    }
+
+    @Test
+    public void testCustomizerMakesAuthorityMismatchHostHeader() throws Exception
+    {
+        AtomicBoolean handled = new AtomicBoolean();
+        _server.setHandler(new Handler.Abstract.NonBlocking()
+        {
+            @Override
+            public boolean handle(Request request, Response response, Callback callback)
+            {
+                handled.set(true);
+                callback.succeeded();
+                return true;
+            }
+        });
+        _server.start();
+
+        MockConnectionMetaData connectionMetaData = new MockConnectionMetaData(new MockConnector(_server));
+        connectionMetaData.getHttpConfiguration().addCustomizer((request, responseHeaders) -> new Request.Wrapper(request)
+        {
+            @Override
+            public HttpURI getHttpURI()
+            {
+                return HttpURI.from("http://elsewhere/");
+            }
+        });
+        HttpChannel channel = new HttpChannelState(connectionMetaData);
+        MockHttpStream stream = new MockHttpStream(channel);
+
+        // The request as received is consistent, it is the customizer that breaks the authority.
+        HttpFields fields = HttpFields.build().add(HttpHeader.HOST, "localhost").asImmutable();
+        MetaData.Request request = new MetaData.Request("GET", HttpURI.from("http://localhost/"), HttpVersion.HTTP_1_1, fields, 0);
+        Runnable task = channel.onRequest(request);
+        task.run();
+
+        assertThat(handled.get(), is(false));
+        assertThat(stream.isComplete(), is(true));
+        assertThat(stream.getResponse(), notNullValue());
+        assertThat(stream.getResponse().getStatus(), equalTo(400));
+    }
+
+    @Test
+    public void testCustomizerRepairsAuthorityMismatchHostHeader() throws Exception
+    {
+        HelloHandler helloHandler = new HelloHandler();
+        _server.setHandler(helloHandler);
+        _server.start();
+
+        MockConnectionMetaData connectionMetaData = new MockConnectionMetaData(new MockConnector(_server));
+        connectionMetaData.getHttpConfiguration().addCustomizer((request, responseHeaders) -> new Request.Wrapper(request)
+        {
+            @Override
+            public HttpURI getHttpURI()
+            {
+                return HttpURI.from("http://localhost/");
+            }
+        });
+        HttpChannel channel = new HttpChannelState(connectionMetaData);
+        MockHttpStream stream = new MockHttpStream(channel);
+
+        // The request as received mismatches, but the customizer makes it consistent.
+        HttpFields fields = HttpFields.build().add(HttpHeader.HOST, "localhost").asImmutable();
+        MetaData.Request request = new MetaData.Request("GET", HttpURI.from("http://elsewhere/"), HttpVersion.HTTP_1_1, fields, 0);
+        Runnable task = channel.onRequest(request);
+        task.run();
+
+        assertThat(stream.isComplete(), is(true));
+        assertThat(stream.getFailure(), nullValue());
+        assertThat(stream.getResponse(), notNullValue());
+        assertThat(stream.getResponse().getStatus(), equalTo(200));
     }
 
     @Test
